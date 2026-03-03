@@ -36,6 +36,7 @@ from telethon.errors import (
     FloodWaitError, PhoneNumberInvalidError
 )
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import PeerChannel
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIGURATION
@@ -191,6 +192,21 @@ def parse_telegram_link(link):
         tid = int(m.group(2)) if m.group(2) else None
         return cid, tid
     return link, None
+
+
+async def resolve_entity(client, chat_id):
+    """Resolve a chat entity, handling numeric IDs for private channels/groups."""
+    if isinstance(chat_id, int) and str(chat_id).startswith('-100'):
+        # Private channel/supergroup — use PeerChannel
+        channel_id = int(str(chat_id)[4:])  # strip -100 prefix
+        try:
+            entity = await client.get_entity(PeerChannel(channel_id))
+            return entity
+        except Exception:
+            # Fallback: try get_entity with full ID
+            return await client.get_entity(chat_id)
+    else:
+        return await client.get_entity(chat_id)
 
 
 def extract_otp(text):
@@ -755,14 +771,12 @@ async def verify_group(event, u):
     try:
         chat_id, topic_id = parse_telegram_link(u.otp_group_link)
         # Try to join if invite hash
-        if isinstance(chat_id, str) and not chat_id.startswith('-'):
+        if isinstance(chat_id, str) and not str(chat_id).startswith('-'):
             try:
                 await u.client(ImportChatInviteRequest(chat_id))
             except Exception:
                 pass
-            entity = await u.client.get_entity(chat_id)
-        else:
-            entity = await u.client.get_entity(chat_id)
+        entity = await resolve_entity(u.client, chat_id)
         title = getattr(entity, 'title', str(chat_id))
         u.otp_group_entity = entity
         u.otp_topic_id = topic_id
@@ -914,7 +928,7 @@ async def _run_task(chat_id, u):
             except Exception:
                 pass
 
-        group_entity = await client.get_entity(chat_id_parsed)
+        group_entity = await resolve_entity(client, chat_id_parsed)
         bot_entity = await client.get_entity(u.target_bot)
         group_title = getattr(group_entity, 'title', '?')
 
@@ -1197,7 +1211,7 @@ async def monitor_start_handler(event, u, uid):
 
     try:
         chat_id_parsed, topic_id = parse_telegram_link(u.otp_group_link)
-        group_entity = await u.client.get_entity(chat_id_parsed)
+        group_entity = await resolve_entity(u.client, chat_id_parsed)
         title = getattr(group_entity, 'title', '?')
 
         monitor_msg = await bot.send_message(
