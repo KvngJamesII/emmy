@@ -1016,12 +1016,12 @@ async def text_handler(event):
 
     # ── Numbers (pasted) ──
     elif u.awaiting == 'numbers_input':
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if lines:
-            u.numbers.extend(lines)
+        numbers = _extract_numbers(text)
+        if numbers:
+            u.numbers.extend(numbers)
             u.awaiting = None
             await event.respond(
-                f'✅ Added **{len(lines)}** numbers (total: **{len(u.numbers)}**)',
+                f'✅ Added **{len(numbers)}** numbers (total: **{len(u.numbers)}**)',
                 buttons=[[Button.inline('🔙 Main Menu', b'main_menu')]],
                 parse_mode='md'
             )
@@ -1060,6 +1060,66 @@ async def text_handler(event):
 
 # ─── File Upload Handler ─────────────────────────────────────
 
+def _decode_file(raw: bytes) -> str:
+    """Auto-detect encoding and decode file bytes to string."""
+    # Check for BOM markers first
+    if raw[:3] == b'\xef\xbb\xbf':
+        return raw[3:].decode('utf-8', errors='ignore')
+    if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return raw.decode('utf-16', errors='ignore')
+    # Try UTF-8 strict
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+    # Try UTF-16 (handles null bytes between chars)
+    if b'\x00' in raw[:100]:
+        try:
+            return raw.decode('utf-16')
+        except Exception:
+            try:
+                return raw.decode('utf-16-le')
+            except Exception:
+                pass
+    # Fallback to latin-1 (never fails)
+    return raw.decode('latin-1')
+
+
+def _extract_numbers(text: str) -> list:
+    """Extract phone numbers from text, handling various formats."""
+    # First try splitting by lines
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # If only 1 line or no lines, try splitting by comma, semicolon, tab, space
+    if len(lines) <= 1:
+        flat = lines[0] if lines else text
+        for sep in [',', ';', '\t', '|']:
+            parts = [p.strip() for p in flat.split(sep) if p.strip()]
+            if len(parts) > 1:
+                lines = parts
+                break
+
+    # If still 1 entry and it's very long, try splitting by spaces
+    if len(lines) <= 1 and lines:
+        raw = lines[0]
+        if len(raw) > 30:
+            parts = raw.split()
+            if len(parts) > 1 and all(any(c.isdigit() for c in p) for p in parts[:5]):
+                lines = parts
+
+    # Clean each number: keep only digits and leading +
+    cleaned = []
+    for line in lines:
+        # Remove common labels/prefixes
+        line = re.sub(r'^[\d]+[.):\-]\s*', '', line)  # strip "1. " or "1) " prefixes
+        # Keep only phone-number characters
+        num = re.sub(r'[^\d+]', '', line)
+        if num and len(num) >= 4:  # at least 4 digits to be a phone number
+            cleaned.append(num)
+
+    return cleaned
+
+
 @bot.on(events.NewMessage(func=lambda e: e.is_private and e.document))
 async def file_handler(event):
     if not is_authorized(event.sender_id):
@@ -1072,18 +1132,26 @@ async def file_handler(event):
 
     try:
         file_bytes = await event.download_media(bytes)
-        text = file_bytes.decode('utf-8', errors='ignore')
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if lines:
-            u.numbers.extend(lines)
+        text = _decode_file(file_bytes)
+        numbers = _extract_numbers(text)
+        if numbers:
+            u.numbers.extend(numbers)
             u.awaiting = None
+            preview = numbers[0] + (' ...' if len(numbers) > 1 else '')
             await event.respond(
-                f'✅ Loaded **{len(lines)}** numbers from file (total: **{len(u.numbers)}**)',
+                f'✅ Loaded **{len(numbers)}** numbers from file\n'
+                f'📊 Total: **{len(u.numbers)}**\n'
+                f'🔍 Preview: `{preview}`',
                 buttons=[[Button.inline('🔙 Main Menu', b'main_menu')]],
                 parse_mode='md'
             )
         else:
-            await event.respond('❌ File was empty or unreadable. Try again.')
+            await event.respond(
+                '❌ No valid numbers found in file.\n\n'
+                'Make sure the file contains phone numbers\n'
+                '(one per line, with or without `+`).',
+                parse_mode='md'
+            )
     except Exception as e:
         await event.respond(f'❌ Error reading file: {e}')
 
