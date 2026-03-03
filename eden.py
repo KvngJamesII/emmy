@@ -41,7 +41,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 #  CONFIGURATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BOT_TOKEN = os.environ.get('EDEN_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+BOT_TOKEN = os.environ.get('EDEN_BOT_TOKEN', '8409880931:AAGTJZQcys7Iqi2IFVNA3AbHjXqz-IV6HhI')
 API_ID = int(os.environ.get('EDEN_API_ID', '24268062'))
 API_HASH = os.environ.get('EDEN_API_HASH', 'aaab3d4a5ab8f7b3024a3edbd88cabf7')
 
