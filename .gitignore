@@ -3,8 +3,11 @@ __pycache__/
 *.db
 *.sqlite3
 *.session
+*.session-journal
 .env
 venv/
 env/
 .vscode/
 *.log
+eden_data.json
+eden_access.json

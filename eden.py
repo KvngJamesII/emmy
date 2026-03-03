@@ -46,11 +46,11 @@ BOT_TOKEN = os.environ.get('EDEN_BOT_TOKEN', '8409880931:AAGTJZQcys7Iqi2IFVNA3Ab
 API_ID = int(os.environ.get('EDEN_API_ID', '24268062'))
 API_HASH = os.environ.get('EDEN_API_HASH', 'aaab3d4a5ab8f7b3024a3edbd88cabf7')
 
-# Restrict who can use the bot. Empty list = anyone can use it.
-# Add Telegram user IDs (integers) to lock it down.
-AUTHORIZED_USERS = []  # e.g. [123456789, 987654321]
+# Admin user ID — full unrestricted access, manages user approvals
+ADMIN_ID = 7648364004
 
 DATA_FILE = 'eden_data.json'
+ACCESS_FILE = 'eden_access.json'
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  LOGGING
@@ -256,10 +256,86 @@ def ts():
 #  ACCESS CONTROL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _load_access():
+    if os.path.exists(ACCESS_FILE):
+        with open(ACCESS_FILE, 'r') as f:
+            return json.load(f)
+    return {}  # { "user_id": { "granted_at": timestamp, "expires_at": timestamp_or_0, "name": "..." } }
+
+
+def _save_access(data):
+    with open(ACCESS_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def grant_access(user_id, name, duration_seconds=0):
+    """Grant access to a user. duration_seconds=0 means infinite."""
+    data = _load_access()
+    now = time.time()
+    expires = 0 if duration_seconds == 0 else now + duration_seconds
+    data[str(user_id)] = {
+        'granted_at': now,
+        'expires_at': expires,
+        'name': name
+    }
+    _save_access(data)
+
+
+def revoke_access(user_id):
+    """Revoke access from a user."""
+    data = _load_access()
+    data.pop(str(user_id), None)
+    _save_access(data)
+
+
 def is_authorized(user_id):
-    if not AUTHORIZED_USERS:
+    """Check if user has active access."""
+    if user_id == ADMIN_ID:
         return True
-    return user_id in AUTHORIZED_USERS
+    data = _load_access()
+    entry = data.get(str(user_id))
+    if not entry:
+        return False
+    expires = entry.get('expires_at', 0)
+    if expires == 0:
+        return True  # infinite access
+    if time.time() > expires:
+        return False  # expired
+    return True
+
+
+def get_access_info(user_id):
+    """Return access details or None."""
+    data = _load_access()
+    return data.get(str(user_id))
+
+
+def get_remaining_time(user_id):
+    """Return human-readable remaining access time."""
+    entry = get_access_info(user_id)
+    if not entry:
+        return None
+    expires = entry.get('expires_at', 0)
+    if expires == 0:
+        return '♾ Unlimited'
+    remaining = expires - time.time()
+    if remaining <= 0:
+        return '⛔ Expired'
+    hours = int(remaining // 3600)
+    mins = int((remaining % 3600) // 60)
+    if hours > 24:
+        days = hours // 24
+        return f'{days}d {hours % 24}h'
+    return f'{hours}h {mins}m'
+
+
+def list_all_access():
+    """Return all access entries."""
+    return _load_access()
+
+
+# Track pending access requests: { user_id: { 'name': '...', 'username': '...', 'time': timestamp } }
+pending_requests = {}
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  KEYBOARD LAYOUTS
@@ -307,11 +383,50 @@ bot = TelegramClient('eden_bot', API_ID, API_HASH)
 
 @bot.on(events.NewMessage(pattern=r'/start'))
 async def cmd_start(event):
-    if not is_authorized(event.sender_id):
-        await event.respond('⛔ You are not authorized to use this bot.')
+    uid = event.sender_id
+
+    # ── Unauthorized user ──
+    if not is_authorized(uid):
+        sender = await event.get_sender()
+        name = getattr(sender, 'first_name', 'Unknown')
+        # Check if they already have a pending request
+        if uid in pending_requests:
+            await event.respond(
+                '⏳ **Access Pending**\n\n'
+                'Your request has been sent to the admin.\n'
+                'Please wait for approval.',
+                parse_mode='md'
+            )
+        else:
+            # Check if expired
+            info = get_access_info(uid)
+            if info and info.get('expires_at', 0) != 0 and time.time() > info['expires_at']:
+                await event.respond(
+                    '⛔ **Access Expired**\n\n'
+                    'Your access has expired. You can request a renewal below.',
+                    buttons=[[Button.inline('🔑 Request Access', b'request_access')]],
+                    parse_mode='md'
+                )
+            else:
+                await event.respond(
+                    '🔒 **Access Required**\n\n'
+                    'You don\'t have access to this bot.\n'
+                    'Click below to request access from the admin.',
+                    buttons=[[Button.inline('🔑 Request Access', b'request_access')]],
+                    parse_mode='md'
+                )
         return
+
     u = get_user(event.chat_id)
     u.awaiting = None
+
+    # Show remaining time for non-admin users
+    access_line = ''
+    if uid != ADMIN_ID:
+        remaining = get_remaining_time(uid)
+        if remaining:
+            access_line = f'\n⏳ Access: {remaining}'
+
     # Try to restore saved session
     if u.session_string and not u.client:
         try:
@@ -325,7 +440,15 @@ async def cmd_start(event):
                 save_user(event.chat_id)
         except Exception:
             u.is_authenticated = False
-    await event.respond(main_menu_text(u), buttons=main_menu_buttons(u), parse_mode='md')
+
+    text = main_menu_text(u)
+    if access_line:
+        text += access_line
+    btns = main_menu_buttons(u)
+    # Admin gets extra button
+    if uid == ADMIN_ID:
+        btns.append([Button.inline('👑 Admin Panel', b'admin_panel')])
+    await event.respond(text, buttons=btns, parse_mode='md')
 
 
 @bot.on(events.NewMessage(pattern=r'/menu'))
@@ -334,25 +457,52 @@ async def cmd_menu(event):
         return
     u = get_user(event.chat_id)
     u.awaiting = None
-    await event.respond(main_menu_text(u), buttons=main_menu_buttons(u), parse_mode='md')
+    btns = main_menu_buttons(u)
+    if event.sender_id == ADMIN_ID:
+        btns.append([Button.inline('👑 Admin Panel', b'admin_panel')])
+    await event.respond(main_menu_text(u), buttons=btns, parse_mode='md')
 
 # ─── CALLBACK QUERY ROUTER ──────────────────────────────────
 
 @bot.on(events.CallbackQuery)
 async def callback_router(event):
-    if not is_authorized(event.sender_id):
-        await event.answer('⛔ Not authorized', alert=True)
+    uid = event.chat_id
+    data = event.data.decode()
+
+    # ── Allow request_access callback for unauthorized users ──
+    if data == 'request_access':
+        await handle_request_access(event)
         return
 
-    uid = event.chat_id
+    # ── Admin-only callbacks (approve/reject/revoke etc.) ──
+    if data.startswith('admin_') or data.startswith('approve_') or data.startswith('reject_') or data.startswith('grant_'):
+        if event.sender_id != ADMIN_ID:
+            await event.answer('⛔ Admin only', alert=True)
+            return
+        await handle_admin_callback(event, data)
+        return
+
+    # ── Normal auth check ──
+    if not is_authorized(event.sender_id):
+        await event.answer('⛔ Not authorized. Send /start to request access.', alert=True)
+        return
+
     u = get_user(uid)
-    data = event.data.decode()
+    data_str = data
 
     try:
         # ── Main Menu ──
-        if data == 'main_menu':
+        if data_str == 'main_menu':
             u.awaiting = None
-            await event.edit(main_menu_text(u), buttons=main_menu_buttons(u), parse_mode='md')
+            btns = main_menu_buttons(u)
+            if event.sender_id == ADMIN_ID:
+                btns.append([Button.inline('👑 Admin Panel', b'admin_panel')])
+            text = main_menu_text(u)
+            if event.sender_id != ADMIN_ID:
+                remaining = get_remaining_time(event.sender_id)
+                if remaining:
+                    text += f'\n⏳ Access: {remaining}'
+            await event.edit(text, buttons=btns, parse_mode='md')
 
         # ── Account ──
         elif data == 'menu_account':
@@ -515,6 +665,240 @@ async def callback_router(event):
     except Exception as e:
         log.error(f'Callback error: {e}')
         await event.answer(f'❌ Error: {str(e)[:100]}', alert=True)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ACCESS REQUEST & ADMIN PANEL
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def handle_request_access(event):
+    """Handle when a user clicks 'Request Access'."""
+    uid = event.sender_id
+    if is_authorized(uid):
+        await event.answer('✅ You already have access!')
+        return
+    if uid in pending_requests:
+        await event.answer('⏳ Request already pending.', alert=True)
+        return
+
+    sender = await event.get_sender()
+    name = getattr(sender, 'first_name', 'Unknown')
+    username = getattr(sender, 'username', None)
+    username_str = f'@{username}' if username else 'No username'
+
+    pending_requests[uid] = {
+        'name': name,
+        'username': username_str,
+        'time': time.time()
+    }
+
+    await event.answer('✅ Request sent!')
+    await event.edit(
+        '⏳ **Access Requested**\n\n'
+        'Your request has been sent to the admin.\n'
+        'You will be notified when it is approved.',
+        parse_mode='md'
+    )
+
+    # Notify admin
+    await bot.send_message(
+        ADMIN_ID,
+        f'🔔 **New Access Request**\n\n'
+        f'👤 Name: **{name}**\n'
+        f'🆔 ID: `{uid}`\n'
+        f'📛 Username: {username_str}\n'
+        f'⏰ Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+        buttons=[
+            [Button.inline('✅ Approve', f'approve_{uid}'.encode()),
+             Button.inline('❌ Reject', f'reject_{uid}'.encode())]
+        ],
+        parse_mode='md'
+    )
+    log.info(f'Access request from {name} ({uid})')
+
+
+async def handle_admin_callback(event, data):
+    """Handle all admin-related callbacks."""
+
+    # ── Approve user ──
+    if data.startswith('approve_'):
+        target_uid = int(data.split('_')[1])
+        # Show timeframe options
+        await event.edit(
+            f'⏱ **Set Access Duration**\n\n'
+            f'User: `{target_uid}`\n'
+            f'How long should they have access?',
+            buttons=[
+                [Button.inline('1 Hour', f'grant_{target_uid}_3600'.encode()),
+                 Button.inline('3 Hours', f'grant_{target_uid}_10800'.encode())],
+                [Button.inline('6 Hours', f'grant_{target_uid}_21600'.encode()),
+                 Button.inline('12 Hours', f'grant_{target_uid}_43200'.encode())],
+                [Button.inline('24 Hours', f'grant_{target_uid}_86400'.encode()),
+                 Button.inline('3 Days', f'grant_{target_uid}_259200'.encode())],
+                [Button.inline('7 Days', f'grant_{target_uid}_604800'.encode()),
+                 Button.inline('30 Days', f'grant_{target_uid}_2592000'.encode())],
+                [Button.inline('♾ Unlimited', f'grant_{target_uid}_0'.encode())],
+                [Button.inline('❌ Cancel', b'admin_panel')]
+            ],
+            parse_mode='md'
+        )
+
+    # ── Grant with duration ──
+    elif data.startswith('grant_'):
+        parts = data.split('_')
+        target_uid = int(parts[1])
+        duration = int(parts[2])
+
+        req = pending_requests.pop(target_uid, {})
+        name = req.get('name', 'Unknown')
+
+        grant_access(target_uid, name, duration)
+
+        if duration == 0:
+            dur_text = '♾ Unlimited'
+        elif duration >= 86400:
+            dur_text = f'{duration // 86400} day(s)'
+        else:
+            dur_text = f'{duration // 3600} hour(s)'
+
+        await event.edit(
+            f'✅ **Access Granted**\n\n'
+            f'👤 {name} (`{target_uid}`)\n'
+            f'⏱ Duration: **{dur_text}**',
+            buttons=[[Button.inline('🔙 Admin Panel', b'admin_panel')]],
+            parse_mode='md'
+        )
+
+        # Notify the user
+        try:
+            await bot.send_message(
+                target_uid,
+                f'🎉 **Access Granted!**\n\n'
+                f'You now have access to Eden OTP Bot.\n'
+                f'⏱ Duration: **{dur_text}**\n\n'
+                f'Send /start to begin!',
+                parse_mode='md'
+            )
+        except Exception:
+            pass
+        log.info(f'Access granted to {name} ({target_uid}) for {dur_text}')
+
+    # ── Reject user ──
+    elif data.startswith('reject_'):
+        target_uid = int(data.split('_')[1])
+        req = pending_requests.pop(target_uid, {})
+        name = req.get('name', 'Unknown')
+
+        await event.edit(
+            f'❌ **Request Rejected**\n\n'
+            f'👤 {name} (`{target_uid}`)',
+            buttons=[[Button.inline('🔙 Admin Panel', b'admin_panel')]],
+            parse_mode='md'
+        )
+
+        # Notify the user
+        try:
+            await bot.send_message(
+                target_uid,
+                '❌ **Access Denied**\n\n'
+                'Your request was not approved by the admin.',
+                parse_mode='md'
+            )
+        except Exception:
+            pass
+        log.info(f'Access rejected for {name} ({target_uid})')
+
+    # ── Admin Panel ──
+    elif data == 'admin_panel':
+        await show_admin_panel(event)
+
+    # ── Revoke specific user ──
+    elif data.startswith('admin_revoke_'):
+        target_uid = int(data.split('_')[2])
+        revoke_access(target_uid)
+        await event.answer(f'🗑 Access revoked for {target_uid}')
+        await show_admin_panel(event)
+
+    # ── View all users ──
+    elif data == 'admin_users':
+        access = list_all_access()
+        if not access:
+            await event.edit(
+                '👥 **Authorized Users**\n\nNo users have access yet.',
+                buttons=[[Button.inline('🔙 Admin Panel', b'admin_panel')]],
+                parse_mode='md'
+            )
+            return
+
+        lines = []
+        for uid_str, info in access.items():
+            name = info.get('name', '?')
+            expires = info.get('expires_at', 0)
+            if expires == 0:
+                status = '♾'
+            elif time.time() > expires:
+                status = '⛔ Expired'
+            else:
+                remaining = expires - time.time()
+                hours = int(remaining // 3600)
+                status = f'{hours}h left'
+            lines.append(f'• {name} (`{uid_str}`) — {status}')
+
+        text = '👥 **Authorized Users**\n\n' + '\n'.join(lines)
+
+        # Build revoke buttons (up to 6 users shown)
+        btns = []
+        for uid_str in list(access.keys())[:6]:
+            name = access[uid_str].get('name', uid_str)
+            btns.append([Button.inline(f'🗑 Revoke {name}', f'admin_revoke_{uid_str}'.encode())])
+        btns.append([Button.inline('🔙 Admin Panel', b'admin_panel')])
+
+        await event.edit(text, buttons=btns, parse_mode='md')
+
+    # ── View pending requests ──
+    elif data == 'admin_pending':
+        if not pending_requests:
+            await event.edit(
+                '📋 **Pending Requests**\n\nNo pending requests.',
+                buttons=[[Button.inline('🔙 Admin Panel', b'admin_panel')]],
+                parse_mode='md'
+            )
+            return
+
+        lines = []
+        btns = []
+        for req_uid, info in pending_requests.items():
+            name = info.get('name', '?')
+            uname = info.get('username', '?')
+            lines.append(f'• {name} ({uname}) — `{req_uid}`')
+            btns.append([
+                Button.inline(f'✅ {name}', f'approve_{req_uid}'.encode()),
+                Button.inline(f'❌ {name}', f'reject_{req_uid}'.encode())
+            ])
+        btns.append([Button.inline('🔙 Admin Panel', b'admin_panel')])
+
+        text = '📋 **Pending Requests**\n\n' + '\n'.join(lines)
+        await event.edit(text, buttons=btns, parse_mode='md')
+
+
+async def show_admin_panel(event):
+    """Show the admin panel."""
+    access = list_all_access()
+    active = sum(1 for v in access.values()
+                 if v.get('expires_at', 0) == 0 or time.time() < v.get('expires_at', 0))
+    pending = len(pending_requests)
+
+    await event.edit(
+        '👑 **Admin Panel**\n\n'
+        f'👥 Active Users: **{active}**\n'
+        f'📋 Pending Requests: **{pending}**\n'
+        f'📊 Total Registered: **{len(access)}**',
+        buttons=[
+            [Button.inline(f'👥 Users ({active})', b'admin_users'),
+             Button.inline(f'📋 Pending ({pending})', b'admin_pending')],
+            [Button.inline('🔙 Main Menu', b'main_menu')]
+        ],
+        parse_mode='md'
+    )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TEXT INPUT HANDLER (conversation state)
