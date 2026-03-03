@@ -36,7 +36,8 @@ from telethon.errors import (
     FloodWaitError, PhoneNumberInvalidError
 )
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import PeerChannel
+from telethon.tl.functions.channels import GetChannelsRequest
+from telethon.tl.types import PeerChannel, InputChannel
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIGURATION
@@ -195,16 +196,32 @@ def parse_telegram_link(link):
 
 
 async def resolve_entity(client, chat_id):
-    """Resolve a chat entity, handling numeric IDs for private channels/groups."""
+    """Resolve a chat entity, handling numeric IDs for private channels/megagroups."""
     if isinstance(chat_id, int) and str(chat_id).startswith('-100'):
-        # Private channel/supergroup — use PeerChannel
         channel_id = int(str(chat_id)[4:])  # strip -100 prefix
+        # Method 1: Use GetChannelsRequest with InputChannel (works for megagroups)
         try:
-            entity = await client.get_entity(PeerChannel(channel_id))
-            return entity
+            result = await client(GetChannelsRequest([InputChannel(channel_id, 0)]))
+            if result.chats:
+                return result.chats[0]
         except Exception:
-            # Fallback: try get_entity with full ID
+            pass
+        # Method 2: Try get_input_entity first, then get_entity
+        try:
+            inp = await client.get_input_entity(PeerChannel(channel_id))
+            return await client.get_entity(inp)
+        except Exception:
+            pass
+        # Method 3: Direct with full -100 ID
+        try:
             return await client.get_entity(chat_id)
+        except Exception:
+            pass
+        # Method 4: Iterate dialogs to find it
+        async for dialog in client.iter_dialogs():
+            if dialog.entity and getattr(dialog.entity, 'id', None) == channel_id:
+                return dialog.entity
+        raise ValueError(f'Could not resolve channel {chat_id}. Make sure the account has joined this group.')
     else:
         return await client.get_entity(chat_id)
 
@@ -363,14 +380,13 @@ def main_menu_text(u):
     nums = f'{len(u.numbers)} loaded' if u.numbers else 'None'
     bot_name = f'@{u.target_bot}'
     return (
-        '╔══════════════════════════════╗\n'
-        '║    🌿 **Eden OTP Bot** 🌿     ║\n'
-        '╚══════════════════════════════╝\n\n'
+        '🌿 **Eden OTP Bot**\n'
+        '━━━━━━━━━━━━━━\n\n'
         f'🔐 Account: {auth}\n'
-        f'📋 OTP Group: {group}\n'
+        f'📋 Group: {group}\n'
         f'📁 Numbers: {nums}\n'
         f'🤖 Target: {bot_name}\n\n'
-        'Select an option below 👇'
+        'Select an option 👇'
     )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
