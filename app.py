@@ -20,7 +20,7 @@ API_HASH_STR = os.environ.get('TELEGRAM_API_HASH', '').strip()
 
 # Store credentials globally, will be set when available
 API_ID = 25509235
-API_HASH = '1f64f43c3937da9548f07a107849e794'
+API_HASH = 'd3629ab967e8ecac197831192aa36d65'
 
 @app.route('/')
 def index():
